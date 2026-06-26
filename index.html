@@ -584,6 +584,11 @@
           <span class="toggle-track"></span>
           Velocity Tuning
         </label>
+        <label class="toggle-label" title="Pan Follow: connect as a MultiFLEX GUI client so FlexRC-28 can move the panadapter alongside the slice, preventing SmartSDR/AetherSDR auto-recentering when tuning near the spectrum edge. Creates a second station on the radio — only enable when using the radio solo or with a MultiFLEX licence. Reconnects automatically when toggled.">
+          <input type="checkbox" id="pan-follow">
+          <span class="toggle-track"></span>
+          Pan Follow
+        </label>
         <label class="toggle-label" title="Tuning Step: choose base per-encoder-step Hz">
           <div style="display:flex;align-items:center;gap:8px;">
             <div class="range-wrap compact-range">
@@ -706,6 +711,7 @@ async function init() {
   document.getElementById('snap-tuning').checked = !!settings.snapTuning;
   document.getElementById('velocity-tuning').checked = settings.velocityTuning !== false;
   document.getElementById('ptt-latch-toggle').checked = (settings.pttLatchEnabled !== false);
+  document.getElementById('pan-follow').checked = !!settings.panFollow;
   // tuningSensitivityLevel: 1 (least sensitive/most reduction) .. 5 (most sensitive)
   document.getElementById('tuning-sensitivity').value = settings.tuningSensitivityLevel || settings.reducedTuningLevel || 10;
 
@@ -829,6 +835,16 @@ function bindEvents() {
     // Apply immediately — don't wait for Save Settings
     await api.settings.save({ velocityTuning: e.target.checked });
     log(`Velocity tuning: ${e.target.checked ? 'ON' : 'OFF'}`);
+  });
+
+  document.getElementById('pan-follow').addEventListener('change', async (e) => {
+    const enabled = !!e.target.checked;
+    await api.settings.save({ panFollow: enabled });
+    if (enabled) {
+      log('Pan Follow: ON — opening secondary MultiFLEX observer…');
+    } else {
+      log('Pan Follow: OFF');
+    }
   });
 
   document.getElementById('tuning-sensitivity').addEventListener('input', async (e) => {

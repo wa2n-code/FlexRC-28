@@ -60,6 +60,9 @@ function saveSettings(settings) {
 let win;
 let rc28, flex, controller;
 let settings = loadSettings();
+// Suppress radio-origin slice updates for a short window after a local tune
+const SLICE_RECENTER_SUPPRESSION_MS = 400; // ms
+const _lastLocalTune = new Map(); // sliceId -> timestamp
 
 function createWindow() {
   win = new BrowserWindow({
@@ -107,6 +110,9 @@ function initHardware() {
   rc28 = new RC28();
   flex = new FlexRadio();
   controller = new Controller(rc28, flex);
+
+  // Apply pan-follow mode before any connection attempt
+  flex.setPanFollow(!!settings.panFollow);
 
   // Apply saved actions
   if (settings.actions && Object.keys(settings.actions).length > 0) {
@@ -157,7 +163,31 @@ function initHardware() {
     send('flex:error', err.message);
   });
 
-  flex.on('sliceUpdated', (id, slice) => {
+  flex.on('sliceUpdated', (id, slice, meta) => {
+    const source = (meta && meta.source) ? meta.source : 'radio';
+    const freqText = slice && slice.freq_mhz ? slice.freq_mhz.toFixed(6) : 'null';
+
+    if (source === 'local') {
+      // Record when a local tune was requested so we can ignore an immediate
+      // radio S-line that reaffirms the previous frequency (which causes
+      // unwanted recentering for encoder users).
+      _lastLocalTune.set(id, Date.now());
+      try { console.log(`[MAIN-SLICE] id=${id} freq=${freqText} source=local`); } catch (_) {}
+      send('flex:sliceUpdated', { id, ...slice });
+      return;
+    }
+
+    // For radio-origin updates, suppress forwarding if a local tune for the
+    // same slice occurred very recently (within the suppression window).
+    const lastLocal = _lastLocalTune.get(id);
+    if (lastLocal && (Date.now() - lastLocal) < SLICE_RECENTER_SUPPRESSION_MS) {
+      try { console.log(`[MAIN-SLICE] id=${id} freq=${freqText} source=radio suppressed (recent local tune)`); } catch (_) {}
+      return;
+    }
+
+    // Not suppressed — forward to renderer and clear any stale local marker.
+    try { console.log(`[MAIN-SLICE] id=${id} freq=${freqText} source=radio`); } catch (_) {}
+    _lastLocalTune.delete(id);
     send('flex:sliceUpdated', { id, ...slice });
   });
 
@@ -216,11 +246,19 @@ function initHardware() {
   // Enable with:  npm start -- --debug
   // Installed app: FlexRC-28.exe --debug
   const debugMode = process.argv.includes('--debug');
+  // Always log raw S-lines to main stdout (timestamped) so captures include
+  // authoritative radio status even when not running in debug mode.
+  flex.on('raw', (line) => {
+    try {
+      console.log(`[MAIN-RAW] ${new Date().toISOString()} ${line}`);
+    } catch (_) {}
+    if (debugMode) {
+      // Forward to renderer in debug mode for UI inspection
+      send('flex:raw', line.slice(0, 200));
+    }
+  });
   if (debugMode) {
     flex.enableRawLogging();
-    flex.on('raw', (line) => {
-      send('flex:raw', line.slice(0, 200));
-    });
     console.log('[FlexRC-28] Debug mode enabled — raw Flex output visible in activity log');
   }
 
@@ -296,6 +334,11 @@ ipcMain.handle('settings:save', (_, newSettings) => {
   if (newSettings.tuningStepOverride !== undefined && controller) {
     if (newSettings.tuningStepOverride === null) controller.setTuningStepOverride(null);
     else if (typeof controller.setTuningStepOverride === 'function') controller.setTuningStepOverride(Number(newSettings.tuningStepOverride) || null);
+  }
+
+  if (newSettings.panFollow !== undefined && flex) {
+    flex.setPanFollow(!!newSettings.panFollow);
+    // Observer starts/stops live — no reconnect needed.
   }
 
   return settings;

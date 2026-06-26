@@ -218,15 +218,23 @@ class Controller extends EventEmitter {
               : tuneFloor(slice.mode);
             let freqHz = Math.round(slice.freq_mhz * 1_000_000);
             const remainder = freqHz % floorHz;
-            if (remainder !== 0) freqHz = Math.round(freqHz / floorHz) * floorHz;
+            if (remainder !== 0) {
+              // Directional snap: bias snapping toward the tuning direction
+              if (deltaHz > 0) freqHz = Math.ceil(freqHz / floorHz) * floorHz;
+              else if (deltaHz < 0) freqHz = Math.floor(freqHz / floorHz) * floorHz;
+              else freqHz = Math.round(freqHz / floorHz) * floorHz;
+            }
             predictedFreqHz = freqHz + deltaHz;
           }
 
           // When tuning RIT, do not pass floor override or rely on velocity.
           if (slice && slice.rit_on) {
+            console.log('[CTRL-TUNE] RIT', { slice: slice.id, applySteps, deltaHz });
             this.flex.tune(deltaHz).catch((e) => { this.emit('error', `Tune failed: ${e.message}`); });
             this.emit('dialMoved', applySteps, deltaHz, this.tuneRate, null);
           } else {
+            // Debug trace for main tuning
+            console.log('[CTRL-TUNE]', { slice: slice ? slice.id : null, applySteps, deltaHz, hz, predictedFreqHz });
             // Pass floor override so flex.tune won't snap to a coarser mode floor
             this.flex.tune(deltaHz, { floorHzOverride: this._userTuningStep }).catch((e) => {
               this.emit('error', `Tune failed: ${e.message}`);
@@ -261,7 +269,7 @@ class Controller extends EventEmitter {
           slice.freq_mhz = snappedMHz;
           this._lastSnapSlice = slice.id;
           this._lastSnapFreq = snappedMHz;
-          this.flex.emit('sliceUpdated', slice.id, { ...slice });
+          this.flex.emit('sliceUpdated', slice.id, { ...slice }, { source: 'local' });
           await this.flex.sendCmd(`slice tune ${slice.id} ${snappedMHz.toFixed(6)}`);
           this.emit('actionExecuted', {
             action: 'snap_khz',
@@ -402,7 +410,7 @@ class Controller extends EventEmitter {
             const slice = this.flex._slices.get(id);
             if (slice) {
               slice.freq_mhz = snappedMHz;
-              this.flex.emit('sliceUpdated', id, { ...slice });
+              this.flex.emit('sliceUpdated', id, { ...slice }, { source: 'local' });
             }
             this.flex.sendCmd(`slice tune ${id} ${snappedMHz.toFixed(6)}`)
               .then(() => {
@@ -436,11 +444,11 @@ class Controller extends EventEmitter {
     // and is a no-op when already on a boundary or moving to a finer mode
     const freqHz = Math.round(slice.freq_mhz * 1_000_000);
     const snapped = Math.round(freqHz / newFloor) * newFloor;
-    if (snapped !== freqHz) {
+        if (snapped !== freqHz) {
       const snappedMHz = snapped / 1_000_000;
       slice.freq_mhz = snappedMHz;
       this.flex.sendCmd(`slice tune ${slice.id} ${snappedMHz.toFixed(6)}`).catch(() => {});
-      this.flex.emit('sliceUpdated', slice.id, { ...slice });
+      this.flex.emit('sliceUpdated', slice.id, { ...slice }, { source: 'local' });
     }
   }
 
@@ -472,7 +480,7 @@ class Controller extends EventEmitter {
             const snappedMHz = snapped / 1_000_000;
             slice.freq_mhz = snappedMHz;
             this.flex.sendCmd(`slice tune ${slice.id} ${snappedMHz.toFixed(6)}`).catch(() => {});
-            this.flex.emit('sliceUpdated', slice.id, { ...slice });
+            this.flex.emit('sliceUpdated', slice.id, { ...slice }, { source: 'local' });
           }
         }
         this.emit('tuneModeChanged', this.tuneRate);

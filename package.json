@@ -7,6 +7,7 @@
   "license": "GPL-3.0",
   "scripts": {
     "start": "electron .",
+    "start:debug": "electron . -- --debug",
     "postinstall": "electron-builder install-app-deps",
     "build": "electron-builder --win",
     "build:dir": "electron-builder --win --dir"

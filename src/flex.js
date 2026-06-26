@@ -40,10 +40,14 @@ class FlexRadio extends EventEmitter {
     this._connected = false;
     this._handle = null;             // our client handle from radio
     this._slices = new Map();        // slice_id -> { freq_mhz, mode, rit_on, rit_freq, ... }
+    this._panadapters = new Map();    // pan_handle -> { center_mhz, bandwidth_mhz }
     this._activeSlice = null;
     this._stationName = null;
     this._radioIP = null;
     this._discoverySocket = null;
+    this._panFollowEnabled = false;  // when true, a secondary GUI connection observes pan state
+    this._panSocket = null;          // secondary TCP socket for pan observation
+    this._panObserverHandle = null;  // client handle assigned to the pan observer by the radio
   }
 
   // ── Discovery ──────────────────────────────────────────────────────────
@@ -124,6 +128,8 @@ class FlexRadio extends EventEmitter {
       this.socket.on('close', () => {
         this._connected = false;
         this._slices.clear();
+        this._panadapters.clear();
+        this._stopPanObserver();
         this.emit('disconnected');
       });
 
@@ -149,6 +155,7 @@ class FlexRadio extends EventEmitter {
   }
 
   disconnect() {
+    this._stopPanObserver();
     if (this.socket) {
       try { this.socket.destroy(); } catch (_) {}
       this.socket = null;
@@ -160,14 +167,27 @@ class FlexRadio extends EventEmitter {
     return this._connected;
   }
 
+  /**
+   * Enable or disable Pan Follow mode.
+   * When enabled a lightweight secondary GUI connection is opened to receive
+   * panadapter centre/bandwidth S-lines (only sent to GUI clients). The main
+   * connection stays non-GUI so slice tune commands work normally.
+   */
+  setPanFollow(enabled) {
+    this._panFollowEnabled = !!enabled;
+    if (!enabled) this._stopPanObserver();
+    else if (this._connected && !this._panSocket) this._startPanObserver();
+  }
+
   async _init() {
-    // Do NOT send "client gui" — that creates a new MultiFLEX station
-    // Just subscribe to status and we'll use xmit for PTT
+    // Stay non-GUI — do NOT send "client gui"
+    // Non-GUI clients can tune slices from any station; GUI clients cannot.
 
     const cmds = [
       'sub slice all',
       'sub tx all',
       'sub atu all',
+      'sub display all',
       'info',
       'slice list',
     ];
@@ -178,6 +198,96 @@ class FlexRadio extends EventEmitter {
       } catch (e) {
         this.emit('log', `init cmd failed: ${cmd} — ${e.message}`);
       }
+    }
+
+    // Start the pan observer after subscriptions are live
+    if (this._panFollowEnabled) {
+      setTimeout(() => this._startPanObserver(), 300);
+    }
+  }
+
+  // ── Pan Observer (secondary GUI connection for pan state) ───────────────
+
+  /**
+   * Open a secondary TCP connection as a GUI client purely to receive
+   * panadapter centre/bandwidth S-lines ("display pan <handle> center=...").
+   * These are only sent to GUI clients; the main non-GUI connection cannot
+   * receive them.  The observed data is stored in this._panadapters so the
+   * delta pan logic in tune() can use accurate centre values.
+   */
+  _startPanObserver() {
+    if (this._panSocket) return;
+    if (!this._radioIP) return;
+
+    const panSock = new net.Socket();
+    this._panSocket = panSock;
+    let buf = '';
+    let seq = 1;
+    let ready = false;
+
+    panSock.connect(FLEX_PORT, this._radioIP, () => {
+      try { console.log('[FLEX-PAN-OBS] observer connected'); } catch (_) {}
+    });
+
+    panSock.on('data', (data) => {
+      buf += data.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const rawLine of lines) {
+        const l = rawLine.trim();
+        if (!l) continue;
+        if (l[0] === 'H') {
+          // Capture the handle the radio assigned to this GUI connection so we
+          // can ignore slices auto-created for this station in the main parser.
+          this._panObserverHandle = l.slice(1); // e.g. "654DA438"
+          try { console.log(`[FLEX-PAN-OBS] handle=${this._panObserverHandle}`); } catch (_) {}
+        } else if (!ready && l[0] === 'V') {
+          ready = true;
+          panSock.write(`C${seq++}|client gui\n`);
+          panSock.write(`C${seq++}|sub display all\n`);
+        } else if (l[0] === 'S') {
+          const pipeIdx = l.indexOf('|');
+          if (pipeIdx < 0) continue;
+          this._parsePanObserverLine(l.slice(pipeIdx + 1));
+        }
+      }
+    });
+
+    panSock.on('error', () => {
+      if (this._panSocket === panSock) this._panSocket = null;
+    });
+
+    panSock.on('close', () => {
+      try { console.log('[FLEX-PAN-OBS] observer disconnected'); } catch (_) {}
+      if (this._panSocket === panSock) this._panSocket = null;
+    });
+  }
+
+  /** Parse a "display pan <handle> ... center=X bandwidth=Y ..." S-line body */
+  _parsePanObserverLine(body) {
+    const tokens = body.split(' ');
+    if (tokens[0] !== 'display' || tokens[1] !== 'pan') return;
+    const panId = tokens[2];
+    if (!panId || !/^0x[0-9a-fA-F]+$/i.test(panId)) return;
+
+    if (!this._panadapters.has(panId)) this._panadapters.set(panId, {});
+    const pan = this._panadapters.get(panId);
+    for (let i = 3; i < tokens.length; i++) {
+      const eqIdx = tokens[i].indexOf('=');
+      if (eqIdx < 0) continue;
+      const k = tokens[i].slice(0, eqIdx);
+      const v = tokens[i].slice(eqIdx + 1);
+      if (k === 'center')    { pan.center_mhz    = parseFloat(v); }
+      if (k === 'bandwidth') { pan.bandwidth_mhz = parseFloat(v); }
+    }
+    try { console.log(`[FLEX-PAN-OBS] pan=${panId} center=${pan.center_mhz?.toFixed(6)} bw=${pan.bandwidth_mhz}`); } catch (_) {}
+  }
+
+  _stopPanObserver() {
+    this._panObserverHandle = null;
+    if (this._panSocket) {
+      try { this._panSocket.destroy(); } catch (_) {}
+      this._panSocket = null;
     }
   }
 
@@ -194,6 +304,9 @@ class FlexRadio extends EventEmitter {
       }
       const seq = this._seq++;
       this._pendingCmds.set(seq, { resolve, reject, cmd });
+      try {
+        console.log(`[FLEX-CMD] seq=${seq} cmd=${cmd}`);
+      } catch (_) {}
       this.socket.write(`C${seq}|${cmd}\n`);
 
       setTimeout(() => {
@@ -251,10 +364,18 @@ class FlexRadio extends EventEmitter {
 
       let freqHz = Math.round(slice.freq_mhz * 1_000_000);
 
-      // Snap current frequency to the chosen floor before applying wheel delta
+      // Snap current frequency to the chosen floor before applying wheel delta.
+      // Use directional snapping so we bias toward the tuning direction
+      // (prevents jumping to a distant multiple when near band edges).
       const remainder = freqHz % floorHz;
       if (remainder !== 0) {
-        freqHz = Math.round(freqHz / floorHz) * floorHz;
+        if (deltaHz > 0) {
+          freqHz = Math.ceil(freqHz / floorHz) * floorHz;
+        } else if (deltaHz < 0) {
+          freqHz = Math.floor(freqHz / floorHz) * floorHz;
+        } else {
+          freqHz = Math.round(freqHz / floorHz) * floorHz;
+        }
       }
 
       const newFreqHz = freqHz + deltaHz;
@@ -262,10 +383,32 @@ class FlexRadio extends EventEmitter {
 
       if (newFreq < 0.1 || newFreq > 60) return;
 
+      // Debug trace: show snapping decision and command being sent
+      try {
+        console.log(`[FLEX-TUNE] slice=${slice.id} floorHz=${floorHz} freqHzBefore=${Math.round(slice.freq_mhz*1_000_000)} freqHzSnapped=${freqHz} deltaHz=${deltaHz} newFreqHz=${newFreqHz} newFreq=${newFreq.toFixed(6)}`);
+      } catch (_) {}
+
       slice.freq_mhz = newFreq;
-      // Emit an immediate sliceUpdated so the UI can reflect the requested
-      // frequency without waiting for the radio status round-trip.
-      this.emit('sliceUpdated', slice.id, { ...slice });
+      // Emit an immediate sliceUpdated (source=local) so the UI can reflect
+      // the requested frequency without waiting for the radio status
+      // round-trip. Tag the event so listeners can distinguish local
+      // requests from authoritative radio S-lines.
+      this.emit('sliceUpdated', slice.id, { ...slice }, { source: 'local' });
+
+      // Pan Follow: proactively move the panadapter centre by the same deltaHz
+      // so the slice stays at the same relative position and SmartSDR/AetherSDR
+      // never needs to trigger its own auto-recenter.
+      // Requires _panFollowEnabled + accurate centre data from panadapter S-lines.
+      if (this._panFollowEnabled && slice.pan) {
+        const panState = this._panadapters.get(slice.pan);
+        if (panState && panState.center_mhz != null) {
+          const newPanCenter = panState.center_mhz + (deltaHz / 1_000_000);
+          panState.center_mhz = newPanCenter;
+          try { console.log(`[FLEX-PAN] pan=${slice.pan} newCenter=${newPanCenter.toFixed(6)}`); } catch (_) {}
+          this.sendCmd(`display pan set ${slice.pan} center=${newPanCenter.toFixed(6)}`).catch(() => {});
+        }
+      }
+
       await this.sendCmd(`slice tune ${slice.id} ${newFreq.toFixed(6)}`);
   }
 }
@@ -291,13 +434,13 @@ class FlexRadio extends EventEmitter {
     slice.rit_freq = clamped;
     await this.sendCmd(`slice set ${sliceId} rit_freq=${clamped}`);
     this.emit('ritChanged', sliceId, clamped);
-    this.emit('sliceUpdated', sliceId, { ...slice });
+    this.emit('sliceUpdated', sliceId, { ...slice }, { source: 'local' });
   }
 
   async clearRIT(sliceId) {
     await this.sendCmd(`slice set ${sliceId} rit_freq=0`);
     const slice = this._slices.get(sliceId);
-    if (slice) { slice.rit_freq = 0; this.emit('sliceUpdated', sliceId, { ...slice }); }
+    if (slice) { slice.rit_freq = 0; this.emit('sliceUpdated', sliceId, { ...slice }, { source: 'local' }); }
     this.emit('ritChanged', sliceId, 0);
   }
 
@@ -314,7 +457,7 @@ class FlexRadio extends EventEmitter {
     }
     await this.sendCmd(`slice set ${sliceId} rit_on=${enabled ? 1 : 0}`);
     this.emit('ritModeChanged', sliceId, enabled);
-    this.emit('sliceUpdated', sliceId, { ...slice });
+    this.emit('sliceUpdated', sliceId, { ...slice }, { source: 'local' });
   }
 
   // ── PTT ────────────────────────────────────────────────────────────────
@@ -337,6 +480,7 @@ class FlexRadio extends EventEmitter {
     const snapped = Math.round(slice.freq_mhz * 1000) / 1000;
     slice.freq_mhz = snapped;
     await this.sendCmd(`slice tune ${slice.id} ${snapped.toFixed(6)}`);
+    this.emit('sliceUpdated', slice.id, { ...slice }, { source: 'local' });
   }
 
   /**
@@ -349,7 +493,7 @@ class FlexRadio extends EventEmitter {
     if (!slice) return;
     slice.mode = modeId(mode);
     await this.sendCmd(`slice set ${sliceId} mode=${modeName(slice.mode)}`);
-    this.emit('sliceUpdated', sliceId, { ...slice });
+    this.emit('sliceUpdated', sliceId, { ...slice }, { source: 'local' });
   }
 
   /**
@@ -366,7 +510,7 @@ class FlexRadio extends EventEmitter {
     slice.freq_mhz = freqMHz;
     await this.sendCmd(`slice set ${sliceId} mode=${modeName(slice.mode)}`);
     await this.sendCmd(`slice tune ${sliceId} ${freqMHz.toFixed(6)}`);
-    this.emit('sliceUpdated', sliceId, { ...slice });
+    this.emit('sliceUpdated', sliceId, { ...slice }, { source: 'local' });
   }
 
   // ── Slice Management ───────────────────────────────────────────────────
@@ -427,6 +571,9 @@ class FlexRadio extends EventEmitter {
         const parts = line.slice(1).split('|');
         const seq = parseInt(parts[0], 10);
         const status = parseInt(parts[1], 16);
+        try {
+          console.log(`[FLEX-RSP] seq=${seq} status=0x${parts[1]} msg=${parts.slice(2).join('|')}`);
+        } catch (_) {}
         const pending = this._pendingCmds.get(seq);
         if (pending) {
           this._pendingCmds.delete(seq);
@@ -472,8 +619,8 @@ class FlexRadio extends EventEmitter {
     const tokens = body.split(' ');
     let objectType, objectId, kvStart;
 
-    if (tokens.length > 1 && /^\d+$/.test(tokens[1])) {
-      // Two-token object: "slice 0", "panadapter 0x..."
+    if (tokens.length > 1 && /^(?:\d+|0x[0-9a-fA-F]+)$/.test(tokens[1])) {
+      // Two-token object: "slice 0", "display 0x40000000"
       objectType = tokens[0];
       objectId   = tokens[1];
       kvStart    = tokens.slice(2);
@@ -506,9 +653,30 @@ class FlexRadio extends EventEmitter {
       if (kv.mode         !== undefined) slice.mode = modeId(kv.mode);  // normalise to integer
       if (kv.rit_on       !== undefined) slice.rit_on = kv.rit_on === '1';
       if (kv.rit_freq     !== undefined) slice.rit_freq = parseInt(kv.rit_freq, 10);
-      if (kv.active       !== undefined && kv.active === '1') this._activeSlice = id;
+      if (kv.pan          !== undefined) {
+        slice.pan = kv.pan;  // panadapter handle e.g. 0x40000000
+      }
+      if (kv.active !== undefined && kv.active === '1') {
+        // Ignore active=1 from slices auto-created for the pan observer's GUI station
+        const normalize = h => h ? h.toLowerCase().replace(/^0x/, '') : '';
+        const sliceOwner = normalize(kv.client_handle);
+        const panObsHandle = normalize(this._panObserverHandle);
+        if (!panObsHandle || sliceOwner !== panObsHandle) {
+          this._activeSlice = id;
+        }
+      }
 
-      this.emit('sliceUpdated', id, { ...slice });
+      this.emit('sliceUpdated', id, { ...slice }, { source: 'radio' });
+      return;
+    }
+
+    if (objectType === 'display' || objectType === 'panadapter') {
+      if (objectId !== null) {
+        if (!this._panadapters.has(objectId)) this._panadapters.set(objectId, {});
+        const pan = this._panadapters.get(objectId);
+        if (kv.center    !== undefined) pan.center_mhz    = parseFloat(kv.center);
+        if (kv.bandwidth !== undefined) pan.bandwidth_mhz = parseFloat(kv.bandwidth);
+      }
       return;
     }
 
